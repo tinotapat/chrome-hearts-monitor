@@ -31,6 +31,7 @@ Key env vars:
 from __future__ import annotations
 
 import argparse
+import email.utils
 import json
 import os
 import random
@@ -58,6 +59,27 @@ SUMMARY_MESSAGE_LIMIT = 1850  # leave headroom below Discord's 2,000-char limit
 SITEMAP_INDEX = BASE + "/sitemap_index.xml"
 SITEMAP_REFRESH_SECONDS = 600
 HEALTH_ALERT_SECONDS = 3600
+
+
+class CrawlBlocked(RuntimeError):
+    def __init__(self, status: int, retry_after: float = 300):
+        super().__init__(f"storefront returned HTTP {status}; pausing requests")
+        self.retry_after = max(300, retry_after)
+
+
+def check_throttle(response: requests.Response) -> None:
+    if response.status_code not in (403, 429):
+        return
+    delay = 300.0
+    value = response.headers.get("Retry-After", "")
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            delay = email.utils.parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            pass
+    raise CrawlBlocked(response.status_code, delay)
 
 # Broad net: every known category slug. Live ones render grids; the rest are
 # valid-but-usually-empty and populate when a drop lands -- which is the point.
@@ -160,6 +182,7 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            check_throttle(r)
             if r.status_code in (200, 404):
                 return r
         except requests.RequestException as exc:
@@ -241,23 +264,27 @@ def discover_category_paths(html: str) -> list[str]:
     return menu_paths + paths
 
 
-def sitemap_category_paths(session: requests.Session) -> list[str]:
+def sitemap_category_paths(session: requests.Session, *, strict: bool = False) -> list[str]:
     """Refresh the storefront's published category list at most every 10 minutes."""
     global _sitemap_paths, _sitemap_checked_at
     now = time.monotonic()
-    if _sitemap_checked_at and now - _sitemap_checked_at < SITEMAP_REFRESH_SECONDS:
+    if not strict and _sitemap_checked_at and now - _sitemap_checked_at < SITEMAP_REFRESH_SECONDS:
         return _sitemap_paths
     _sitemap_checked_at = now
     try:
         index = session.get(SITEMAP_INDEX, timeout=10)
+        check_throttle(index)
         index.raise_for_status()
         sitemap_urls = [node.text for node in ET.fromstring(index.content).iter()
                         if node.tag.endswith("}loc") and node.text]
+        if strict and not sitemap_urls:
+            raise RuntimeError("sitemap index is empty; refusing to seed")
         paths = []
-        for url in sitemap_urls[:4]:
+        for url in sitemap_urls:
             if urlparse(url).netloc != "www.chromehearts.com":
                 continue
             response = session.get(url, timeout=10)
+            check_throttle(response)
             response.raise_for_status()
             for node in ET.fromstring(response.content).iter():
                 if not node.tag.endswith("}loc") or not node.text:
@@ -271,17 +298,21 @@ def sitemap_category_paths(session: requests.Session) -> list[str]:
                         slug not in UTILITY_SLUGS and path not in paths):
                     paths.append(path)
         _sitemap_paths = paths
+        if strict and not paths:
+            raise RuntimeError("sitemap has no category paths; refusing to seed")
         return paths
     except (requests.RequestException, ET.ParseError, DefusedXmlException) as exc:
+        if strict:
+            raise RuntimeError("sitemap refresh failed; refusing to seed") from None
         log(f"sitemap refresh failed: {exc}")
         return _sitemap_paths
 
 
-def crawl(session: requests.Session) -> tuple[dict[str, Product], int]:
+def crawl(session: requests.Session, *, strict: bool = False) -> tuple[dict[str, Product], int]:
     catalog: dict[str, Product] = {}
     queued = (["/"] + [f"/{c}" for c in CATEGORIES] +
               [f"{CATEGORY_ENDPOINT}?cgid={cid}" for cid in CATEGORY_IDS] +
-              sitemap_category_paths(session))
+              sitemap_category_paths(session, strict=strict))
     seen: set[str] = set()
     discovered = 0
     fetched = 0
@@ -318,7 +349,12 @@ def crawl(session: requests.Session) -> tuple[dict[str, Product], int]:
 # --------------------------------------------------------------------------- #
 
 def load_state() -> dict[str, dict]:
-    return json.loads(STATE_FILE.read_text())
+    state = json.loads(STATE_FILE.read_text())
+    if not isinstance(state, dict) or any(
+            not isinstance(pid, str) or not pid or not isinstance(product, dict)
+            for pid, product in state.items()):
+        raise RuntimeError("invalid state structure; restore history from backup")
+    return state
 
 
 def save_state(catalog: dict[str, Product | dict]) -> None:
@@ -328,7 +364,10 @@ def save_state(catalog: dict[str, Product | dict]) -> None:
         pid: asdict(product) if isinstance(product, Product) else product
         for pid, product in catalog.items()
     }
-    tmp.write_text(json.dumps(serialized, indent=2, ensure_ascii=False))
+    with tmp.open("w") as handle:
+        json.dump(serialized, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.replace(STATE_FILE)  # atomic, so a crash mid-write can't corrupt state
 
 
@@ -393,7 +432,9 @@ def notify_new(products: list[Product]) -> None:
 # --------------------------------------------------------------------------- #
 
 def sweep(session: requests.Session, *, seed: bool, dry_run: bool) -> None:
-    catalog, fetch_errors = crawl(session)
+    if seed and STATE_FILE.exists():
+        raise RuntimeError("state already exists; refusing to overwrite product history")
+    catalog, fetch_errors = crawl(session, strict=seed)
     if not catalog:
         raise RuntimeError("crawl found no products; refusing to update state")
     if seed:
@@ -464,11 +505,17 @@ def main() -> int:
             log(f"startup ping failed: {exc}")
 
     last_health_alert = None
+    consecutive_errors = 0
     while True:
         t0 = time.monotonic()
+        delay = 0.0
         try:
             sweep(session, seed=False, dry_run=args.dry_run)
+            consecutive_errors = 0
         except Exception as exc:  # never let one bad sweep kill the worker
+            consecutive_errors += 1
+            delay = min(1800, max(POLL_SECONDS, 30) * 2 ** min(consecutive_errors, 6))
+            delay = max(delay, getattr(exc, "retry_after", 0))
             log(f"sweep error (continuing): {exc!r}")
             if (not args.dry_run and
                     (last_health_alert is None or
@@ -479,7 +526,7 @@ def main() -> int:
                 except Exception as alert_exc:
                     log(f"health alert failed: {alert_exc!r}")
         elapsed = time.monotonic() - t0
-        time.sleep(max(2.0, POLL_SECONDS - elapsed) + random.uniform(0, 4))
+        time.sleep(max(2.0, delay, POLL_SECONDS - elapsed) + random.uniform(0, 4))
 
 
 if __name__ == "__main__":
