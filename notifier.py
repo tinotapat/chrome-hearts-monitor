@@ -12,6 +12,7 @@ Discord/Twilio use plain HTTP (no extra dependency). Email uses stdlib smtplib.
 from __future__ import annotations
 
 import os
+import re
 import smtplib
 import sys
 from email.mime.text import MIMEText
@@ -26,8 +27,7 @@ def _http_error(service: str, resp: requests.Response) -> RuntimeError:
 def _env(name: str) -> str:
     val = os.environ.get(name)
     if not val:
-        print(f"[notifier] missing env var: {name}", file=sys.stderr)
-        raise SystemExit(1)
+        raise RuntimeError(f"missing env var: {name}")
     return val
 
 
@@ -39,17 +39,20 @@ def _send_discord(body: str, *, suppress_embeds: bool = False) -> None:
     The URL itself is the secret; anyone with it can post to that channel.
     """
     url = _env("DISCORD_WEBHOOK_URL")
-    payload = {"content": body[:2000]}
+    if not re.fullmatch(r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9._-]+", url):
+        raise RuntimeError("DISCORD_WEBHOOK_URL must be a valid discord.com webhook URL")
+    payload = {"content": body[:2000], "allowed_mentions": {"parse": []}}
     if suppress_embeds:
         payload["flags"] = 1 << 2  # Discord SUPPRESS_EMBEDS
     try:
-        resp = requests.post(url, json=payload, timeout=30)
+        resp = requests.post(url, params={"wait": "true"}, json=payload,
+                             timeout=30, allow_redirects=False)
     except requests.RequestException as exc:
         if isinstance(exc, requests.HTTPError) and exc.response is not None:
-            raise _http_error("Discord webhook", exc.response) from exc
-        raise RuntimeError("Discord webhook request failed") from exc
+            raise RuntimeError(f"Discord webhook returned HTTP {exc.response.status_code}") from None
+        raise RuntimeError("Discord webhook request failed; delivery may be unconfirmed") from None
     if resp.status_code >= 300:
-        raise _http_error("Discord webhook", resp)
+        raise RuntimeError(f"Discord webhook returned HTTP {resp.status_code}") from None
     print("[discord] sent")
 
 

@@ -1,0 +1,31 @@
+services:
+  - type: worker
+    name: chrome-hearts-monitor
+    runtime: python
+    region: oregon
+    plan: 0.5c-512mb
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: pip install -r requirements.lock
+    startCommand: python -u cloud_worker.py
+    disk:
+      name: chrome-hearts-history
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: NOTIFY_METHOD
+        value: discord
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: CH_STATE_FILE
+        value: /data/seen_products.json
+      - key: CH_DATA_DIR
+        value: /data
+      - key: CH_POLL_SECONDS
+        value: "30"
+      - key: CH_STARTUP_PING
+        value: "1"
+      - key: CH_RUN_MODE
+        sync: false

@@ -1,5 +1,9 @@
 # secrets — set these as Railway Variables, never commit them
 .env
+.env.*
+!.env.example
+*.initialized
+.monitor.lock
 
 # local state (on Railway this lives on a mounted volume, not in the repo)
 seen_products.json

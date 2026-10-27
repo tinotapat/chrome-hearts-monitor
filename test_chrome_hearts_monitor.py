@@ -56,6 +56,7 @@ class ProductDiscoveryTests(unittest.TestCase):
         class Response:
             def __init__(self, content):
                 self.content = content
+                self.status_code = 200
 
             def raise_for_status(self):
                 pass
@@ -70,6 +71,7 @@ class ProductDiscoveryTests(unittest.TestCase):
 
     def test_sitemap_rejects_entity_declarations(self):
         class Response:
+            status_code = 200
             content = b'<!DOCTYPE x [<!ENTITY x "bad">]><sitemapindex><loc>&x;</loc></sitemapindex>'
 
             def raise_for_status(self):
@@ -145,9 +147,9 @@ class ProductDiscoveryTests(unittest.TestCase):
             status_code = 429
             text = 'rate limited'
 
-        with patch.dict(notifier.os.environ, {'DISCORD_WEBHOOK_URL': 'https://example.test/webhook'}), \
+        with patch.dict(notifier.os.environ, {'DISCORD_WEBHOOK_URL': 'https://discord.com/api/webhooks/123/test-token'}), \
              patch.object(notifier.requests, 'post', return_value=Response()):
-            with self.assertRaisesRegex(RuntimeError, "HTTP 429: 'rate limited'"):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
                 notifier._send_discord('test')
 
     def test_twilio_http_error_includes_bounded_response(self):
@@ -165,14 +167,14 @@ class ProductDiscoveryTests(unittest.TestCase):
         self.assertIn('x' * 200, str(caught.exception))
         self.assertNotIn('x' * 201, str(caught.exception))
 
-    def test_wrapped_http_error_keeps_response_content(self):
+    def test_wrapped_discord_http_error_omits_response_content(self):
         response = notifier.requests.Response()
         response.status_code = 403
         response._content = b'forbidden'
         error = notifier.requests.HTTPError(response=response)
-        with patch.dict(notifier.os.environ, {'DISCORD_WEBHOOK_URL': 'https://example.test/webhook'}), \
+        with patch.dict(notifier.os.environ, {'DISCORD_WEBHOOK_URL': 'https://discord.com/api/webhooks/123/test-token'}), \
              patch.object(notifier.requests, 'post', side_effect=error):
-            with self.assertRaisesRegex(RuntimeError, "HTTP 403: 'forbidden'"):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
                 notifier._send_discord('test')
 
     def test_failed_health_alert_retries_then_throttles_after_success(self):
